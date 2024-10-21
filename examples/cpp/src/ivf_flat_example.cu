@@ -20,10 +20,20 @@
 #include <raft/core/device_resources.hpp>
 #include <raft/core/resource/thrust_policy.hpp>
 #include <cuvs/neighbors/ivf_flat.hpp>
+#include <cuvs/neighbors/brute_force.hpp>
+#include <cuvs/neighbors/cagra.hpp>
 #include <raft/util/cudart_utils.hpp>
+#include <raft/stats/neighborhood_recall.cuh>
 
+#include <rmm/aligned.hpp>
 #include <rmm/mr/device/device_memory_resource.hpp>
+#include <rmm/mr/device/cuda_memory_resource.hpp>
+#include <rmm/mr/device/cuda_async_memory_resource.hpp>
 #include <rmm/mr/device/pool_memory_resource.hpp>
+#include <rmm/mr/device/managed_memory_resource.hpp>
+#include <rmm/mr/device/prefetch_resource_adaptor.hpp>
+#include <rmm/mr/device/statistics_resource_adaptor.hpp>
+#include <rmm/mr/device/owning_wrapper.hpp>
 
 #include <thrust/copy.h>
 #include <thrust/device_ptr.h>
@@ -31,125 +41,141 @@
 
 #include <cstdint>
 #include <optional>
+#include <chrono>
 
-void ivf_flat_build_search_simple(raft::device_resources const& dev_resources,
-                                  raft::device_matrix_view<const float, int64_t> dataset,
-                                  raft::device_matrix_view<const float, int64_t> queries)
+
+/// MR factory functions
+inline auto make_cuda() { return std::make_shared<rmm::mr::cuda_memory_resource>(); }
+
+inline auto make_async() { return std::make_shared<rmm::mr::cuda_async_memory_resource>(); }
+
+inline auto make_managed() { return std::make_shared<rmm::mr::managed_memory_resource>(); }
+
+inline auto make_prefetch() {
+  return rmm::mr::make_owning_wrapper<rmm::mr::prefetch_resource_adaptor>(make_managed());
+}
+
+inline std::shared_ptr<rmm::mr::device_memory_resource> create_memory_resource(
+  std::string const& allocation_mode)
+{
+  if (allocation_mode == "cuda") return make_cuda();
+  if (allocation_mode == "async") return make_async();
+  if (allocation_mode == "managed") return make_managed();
+  if (allocation_mode == "prefetch") return make_prefetch();
+  return make_managed();
+}
+
+void ivf_search(raft::device_resources const& res,
+                raft::device_matrix_view<const float, int64_t> dataset,
+                raft::device_matrix_view<const float, int64_t> queries,
+                int64_t n_list,
+                int64_t n_probe,
+                int64_t top_k)
 {
   using namespace cuvs::neighbors;
+  std::cout << "Performing IVF-FLAT search" << std::endl;
 
+  // Build the IVF-FLAT index
   ivf_flat::index_params index_params;
-  index_params.n_lists                  = 1024;
+  index_params.n_lists                  = n_list;
   index_params.kmeans_trainset_fraction = 0.1;
+  index_params.kmeans_n_iters           = 100;
   index_params.metric                   = cuvs::distance::DistanceType::L2Expanded;
-
-  std::cout << "Building IVF-Flat index" << std::endl;
-  auto index = ivf_flat::build(dev_resources, index_params, dataset);
-
-  std::cout << "Number of clusters " << index.n_lists() << ", number of vectors added to index "
+  auto s = std::chrono::high_resolution_clock::now();
+  auto index = ivf_flat::build(res, index_params, dataset);
+  auto e = std::chrono::high_resolution_clock::now();
+  std::cout
+    << "[TIME] Train and index: "
+    << std::chrono::duration_cast<std::chrono::milliseconds>(e - s).count()
+    << " ms" << std::endl;
+  std::cout << "[INFO] Number of clusters " << index.n_lists() << ", number of vectors added to index "
             << index.size() << std::endl;
 
-  // Create output arrays.
-  int64_t topk      = 10;
+  // Define arrays to hold search output results
   int64_t n_queries = queries.extent(0);
-  auto neighbors    = raft::make_device_matrix<int64_t>(dev_resources, n_queries, topk);
-  auto distances    = raft::make_device_matrix<float>(dev_resources, n_queries, topk);
+  auto neighbors    = raft::make_device_matrix<int64_t, int64_t>(res, n_queries, top_k);
+  auto distances    = raft::make_device_matrix<float, int64_t>(res, n_queries, top_k);
 
-  // Set search parameters.
+  // Perform the search operation
   ivf_flat::search_params search_params;
-  search_params.n_probes = 50;
-
-  // Search K nearest neighbors for each of the queries.
+  search_params.n_probes = n_probe;
+  s = std::chrono::high_resolution_clock::now();
   ivf_flat::search(
-    dev_resources, search_params, index, queries, neighbors.view(), distances.view());
+    res, search_params, index, queries, neighbors.view(), distances.view());
+  e = std::chrono::high_resolution_clock::now();
+  std::cout
+      << "[TIME] Search: "
+      << std::chrono::duration_cast<std::chrono::milliseconds>(e - s).count()
+      << " ms" << std::endl;
 
-  // The call to ivf_flat::search is asynchronous. Before accessing the data, sync by calling
-   raft::resource::sync_stream(dev_resources);
-
-  print_results(dev_resources, neighbors.view(), distances.view());
+  // Brute force search for reference
+  auto reference_neighbors = raft::make_device_matrix<int64_t, int64_t>(res, n_queries, top_k);
+  auto reference_distances = raft::make_device_matrix<float, int64_t>(res, n_queries, top_k); 
+  auto brute_force_index = cuvs::neighbors::brute_force::build(res, dataset);
+  cuvs::neighbors::brute_force::search(res,
+                                     brute_force_index,
+                                     queries,
+                                     reference_neighbors.view(),
+                                     reference_distances.view());
+  float const recall_scalar = 0.0;
+  auto recall_value = raft::make_host_scalar(recall_scalar);
+  raft::stats::neighborhood_recall(res,
+                                  raft::make_const_mdspan(neighbors.view()),
+                                  raft::make_const_mdspan(reference_neighbors.view()),
+                                  recall_value.view());
+  std::cout << "[INFO] Recall@" << top_k << ": " << recall_value(0) << std::endl;
 }
 
-void ivf_flat_build_extend_search(raft::device_resources const& dev_resources,
-                                  raft::device_matrix_view<const float, int64_t> dataset,
-                                  raft::device_matrix_view<const float, int64_t> queries)
+int main(int argc, char **argv)
 {
-  using namespace cuvs::neighbors;
+  if (argc != 6) {
+    std::cout << argv[0] << " <learn_limit> <n_probe> <algo> <dataset_dir> <mem_type>" << std::endl;
+    exit(1);
+  }
 
-  // Define dataset indices.
-  auto data_indices = raft::make_device_vector<int64_t, int64_t>(dev_resources, dataset.extent(0));
-  thrust::counting_iterator<int64_t> first(0);
-  thrust::device_ptr<int64_t> ptr(data_indices.data_handle());
-  thrust::copy(
-    raft::resource::get_thrust_policy(dev_resources), first, first + dataset.extent(0), ptr);
+  // Get params from the user
+  int64_t learn_limit = std::stoi(argv[1]);
+  int64_t n_probe = std::stoi(argv[2]);
+  std::string algo = argv[3];
+  std::string dataset_dir = argv[4];
+  std::string mem_type = argv[5];
 
-  // Sub-sample the dataset to create a training set.
-  auto trainset =
-    subsample(dev_resources, dataset, raft::make_const_mdspan(data_indices.view()), 0.1);
+  // Set the memory resources
+  raft::device_resources res;
+  auto stream = raft::resource::get_cuda_stream(res);
+  auto mr = create_memory_resource(mem_type);
+  auto stats_mr =
+    rmm::mr::statistics_resource_adaptor<rmm::mr::device_memory_resource>(mr.get());
+  rmm::mr::set_current_device_resource(&stats_mr);
 
-  ivf_flat::index_params index_params;
-  index_params.n_lists           = 100;
-  index_params.metric            = cuvs::distance::DistanceType::L2Expanded;
-  index_params.add_data_on_build = false;
+  // Read the dataset files
+  std::string dataset_path = dataset_dir + "/dataset.bin";
+  std::string query_path = dataset_dir + "/query.bin";
+  
+  auto dataset_device = read_bin_dataset<float, int64_t>(res, dataset_path.c_str(), learn_limit);
+  auto queries_device = read_bin_dataset<float, int64_t>(res, query_path.c_str(), 10'000);
 
-  std::cout << "\nRun k-means clustering using the training set" << std::endl;
-  auto index =
-    ivf_flat::build(dev_resources, index_params, raft::make_const_mdspan(trainset.view()));
+  int64_t n_dataset = dataset_device.extent(0);
+  int64_t d_dataset = dataset_device.extent(1);
+  int64_t n_queries = queries_device.extent(0);
+  int64_t d_queries = queries_device.extent(1);
 
-  std::cout << "Number of clusters " << index.n_lists() << ", number of vectors added to index "
-            << index.size() << std::endl;
+  std::cout << "Dataset: " << n_dataset << "x" << d_dataset << std::endl;
+  std::cout << "Queries: " << n_queries << "x" << d_queries << std::endl;
 
-  std::cout << "Filling index with the dataset vectors" << std::endl;
-  index = ivf_flat::extend(dev_resources,
-                           dataset,
-                           std::make_optional(raft::make_const_mdspan(data_indices.view())),
-                           index);
+  // Set the index and search params
+  int64_t n_list = int64_t(4 * std::sqrt(n_dataset));
+  int64_t top_k = 100;
 
-  std::cout << "Index size after addin dataset vectors " << index.size() << std::endl;
+  if (algo == "ivf") {
+    ivf_search(res,
+              raft::make_const_mdspan(dataset_device.view()),
+              raft::make_const_mdspan(queries_device.view()),
+              n_list,
+              n_probe,
+              top_k);
+  }
 
-  // Set search parameters.
-  ivf_flat::search_params search_params;
-  search_params.n_probes = 10;
-
-  // Create output arrays.
-  int64_t topk      = 10;
-  int64_t n_queries = queries.extent(0);
-  auto neighbors    = raft::make_device_matrix<int64_t, int64_t>(dev_resources, n_queries, topk);
-  auto distances    = raft::make_device_matrix<float, int64_t>(dev_resources, n_queries, topk);
-
-  // Search K nearest neighbors for each queries.
-  ivf_flat::search(
-    dev_resources, search_params, index, queries, neighbors.view(), distances.view());
-
-  // The call to ivf_flat::search is asynchronous. Before accessing the data, sync using:
-   raft::resource::sync_stream(dev_resources);
-
-  print_results(dev_resources, neighbors.view(), distances.view());
-}
-
-int main()
-{
-  raft::device_resources dev_resources;
-
-  // Set pool memory resource with 1 GiB initial pool size. All allocations use the same pool.
-  rmm::mr::pool_memory_resource<rmm::mr::device_memory_resource> pool_mr(
-    rmm::mr::get_current_device_resource(), 1024 * 1024 * 1024ull);
-  rmm::mr::set_current_device_resource(&pool_mr);
-
-  // Create input arrays.
-  int64_t n_samples = 10000;
-  int64_t n_dim     = 3;
-  int64_t n_queries = 10;
-  auto dataset      = raft::make_device_matrix<float, int64_t>(dev_resources, n_samples, n_dim);
-  auto queries      = raft::make_device_matrix<float, int64_t>(dev_resources, n_queries, n_dim);
-  generate_dataset(dev_resources, dataset.view(), queries.view());
-
-  // Simple build and search example.
-  ivf_flat_build_search_simple(dev_resources,
-                               raft::make_const_mdspan(dataset.view()),
-                               raft::make_const_mdspan(queries.view()));
-
-  // Build and extend example.
-  ivf_flat_build_extend_search(dev_resources,
-                               raft::make_const_mdspan(dataset.view()),
-                               raft::make_const_mdspan(queries.view()));
+  res.sync_stream();
+  std::cout << "[INFO] Peak memory usage: " << (stats_mr.get_bytes_counter().peak / 1048576.0) << " MB\n";
 }
