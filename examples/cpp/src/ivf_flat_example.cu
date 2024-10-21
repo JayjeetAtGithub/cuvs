@@ -15,6 +15,7 @@
  */
 
 #include "common.cuh"
+#include "CLI11.hpp"
 
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/device_resources.hpp>
@@ -55,6 +56,18 @@ inline auto make_prefetch() {
   return rmm::mr::make_owning_wrapper<rmm::mr::prefetch_resource_adaptor>(make_managed());
 }
 
+inline auto make_managed_pool()
+{
+  return rmm::mr::make_owning_wrapper<rmm::mr::pool_memory_resource>(
+    make_managed(), rmm::percent_of_free_device_memory(50));
+}
+
+inline auto make_prefetch_pool()
+{
+  return rmm::mr::make_owning_wrapper<rmm::mr::pool_memory_resource>(
+    make_prefetch(), rmm::percent_of_free_device_memory(50));
+}
+
 inline std::shared_ptr<rmm::mr::device_memory_resource> create_memory_resource(
   std::string const& allocation_mode)
 {
@@ -62,6 +75,8 @@ inline std::shared_ptr<rmm::mr::device_memory_resource> create_memory_resource(
   if (allocation_mode == "async") return make_async();
   if (allocation_mode == "managed") return make_managed();
   if (allocation_mode == "prefetch") return make_prefetch();
+  if (allocation_mode == "managed_pool") return make_managed_pool();
+  if (allocation_mode == "prefetch_pool") return make_prefetch_pool();
   return make_managed();
 }
 
@@ -102,6 +117,7 @@ void ivf_search(raft::device_resources const& res,
   s = std::chrono::high_resolution_clock::now();
   ivf_flat::search(
     res, search_params, index, queries, neighbors.view(), distances.view());
+  raft::resource::sync_stream(res);
   e = std::chrono::high_resolution_clock::now();
   std::cout
       << "[TIME] Search: "
@@ -117,6 +133,7 @@ void ivf_search(raft::device_resources const& res,
                                      queries,
                                      reference_neighbors.view(),
                                      reference_distances.view());
+  raft::resource::sync_stream(res);
   float const recall_scalar = 0.0;
   auto recall_value = raft::make_host_scalar(recall_scalar);
   raft::stats::neighborhood_recall(res,
@@ -128,17 +145,41 @@ void ivf_search(raft::device_resources const& res,
 
 int main(int argc, char **argv)
 {
-  if (argc != 6) {
-    std::cout << argv[0] << " <learn_limit> <n_probe> <algo> <dataset_dir> <mem_type>" << std::endl;
-    exit(1);
-  }
+  CLI::App app{"Run CUVS Benchmarks"};
+  argv = app.ensure_utf8(argv);
 
-  // Get params from the user
-  int64_t learn_limit = std::stoi(argv[1]);
-  int64_t n_probe = std::stoi(argv[2]);
-  std::string algo = argv[3];
-  std::string dataset_dir = argv[4];
-  std::string mem_type = argv[5];
+  std::string dataset_dir;
+  app.add_option("-d,--dataset-dir", dataset_dir, "Path to the dataset");
+
+  std::string algo = "ivf";
+  app.add_option("--algo", algo, "Algorithm to run: cagra or ivf");
+
+  std::string mem_type = "cuda";
+  app.add_option("--mem-type", mem_type, "Memory type: cuda / async / managed / prefetch");
+
+  int64_t cuda_device = 0;
+  app.add_option("--cuda-device", cuda_device, "The CUDA device to use");
+
+  int64_t learn_limit = 10000;
+  app.add_option("--learn-limit", learn_limit,
+                 "Limit the number of learn vectors");
+
+  int64_t search_limit = 10000;
+  app.add_option("--search-limit", search_limit,
+                 "Limit the number of search vectors");
+
+  int64_t top_k = 10;
+  app.add_option("-k,--top-k", top_k, "Number of nearest neighbors");
+
+  int64_t n_probe = 32;
+  app.add_option("--n-probe", n_probe, "Number of probes");
+
+  CLI11_PARSE(app, argc, argv);
+
+  if (dataset_dir.empty()) {
+    std::cerr << "[ERROR] Please provide a dataset directory" << std::endl;
+    return 1;
+  }
 
   // Set the memory resources
   raft::device_resources res;
@@ -165,7 +206,6 @@ int main(int argc, char **argv)
 
   // Set the index and search params
   int64_t n_list = int64_t(4 * std::sqrt(n_dataset));
-  int64_t top_k = 100;
 
   if (algo == "ivf") {
     ivf_search(res,
@@ -176,6 +216,6 @@ int main(int argc, char **argv)
               top_k);
   }
 
-  res.sync_stream();
+  raft::resource::sync_stream(res);
   std::cout << "[INFO] Peak memory usage: " << (stats_mr.get_bytes_counter().peak / 1048576.0) << " MB\n";
 }
